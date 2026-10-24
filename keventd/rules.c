@@ -1045,6 +1045,8 @@ static int match_key(const struct rule *r, const struct rule_key *k,
 		if (!k->attr)
 			return (k->op == OP_MATCH_NE);
 		subject = uevent_getenv(ev, k->attr);
+		if (!subject)
+			subject = "";
 		break;
 	case KEY_CONST: {
 		if (!k->attr) {
