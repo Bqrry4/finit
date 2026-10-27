@@ -2146,235 +2146,45 @@ static void parse_cmdline_args(svc_t *svc, char *cmd, char **args)
 	svc->args_dirty = (diff > 0);
 }
 
-/**
- * service_register - Register service, task or run commands
- * @type:   %SVC_TYPE_SERVICE(0), %SVC_TYPE_TASK(1), %SVC_TYPE_RUN(2)
- * @cfg:    Configuration, complete command, with -- for description text
- * @rlimit: Limits for this service/task/run, may be global limits
- * @file:   The file name service was loaded from
- *
- * This function is used to register commands to be run on different
- * system runlevels with optional username.  The @type argument details
- * if it's service to bo monitored/respawned (daemon), a one-shot task
- * or a command that must run in sequence and not in parallel, like
- * service and task commands do.
- *
- * The @line can optionally start with a username, denoted by an @
- * character. Like this:
- *
- *     service @username [!0-6,S] <!COND> /path/to/daemon arg -- Description
- *     task @username [!0-6,S] /path/to/task arg              -- Description
- *     run  @username [!0-6,S] /path/to/cmd arg               -- Description
- *
- * If the username is left out the command is started as root.  The []
- * brackets denote the allowed runlevels, if left out the default for a
- * service is set to [2-5].  Allowed runlevels mimic that of SysV init
- * with the addition of the 'S' runlevel, which is only run once at
- * startup.  It can be seen as the system bootstrap.  If a task or run
- * command is listed in more than the [S] runlevel they will be called
- * when changing runlevel.
- *
- * Services (daemons) also support an optional <!condition> argument.
- * This is for services that depend on another service, e.g. Quagga ripd
- * depends on zebra, or require a system gateway or interface to be up
- * before they are started.  Or restarted, or even SIGHUP'ed, when the
- * gateway changes or interfaces come and go.  The special case when a
- * service is declared with <!> means it does not support SIGHUP but
- * must be STOP/START'ed at system reconfiguration.  For run/task a <!>
- * means Finit can relax its promise to run at least once per runlevel.
- * I.e., for run/task conditions that would otherwise block bootstrap:
- *
- *     task [S0123456789] <!sys/pwr/fail> name:pwrfail initctl poweroff -- Power failure, shutting down
- *
- * Conditions can for example be: pid/NAME:ID for process dependencies,
- * net/<IFNAME>/up or net/<IFNAME>/exists.  The condition handling is
- * further described in doc/conditions.md, but worth mentioning here is
- * that the condition a services *provides* can be modified using the
- * :ID and name:foo syntax.
- *
- * For multiple instances of the same command, e.g. multiple DHCP
- * clients, the user must enter an ID, using the :ID syntax.
- *
- *     service :eth1 /sbin/udhcpc -i eth1
- *     service :eth2 /sbin/udhcpc -i eth2
- *
- * Without the :ID syntax, Finit replaces the first service line with
- * the contents of the second.  The :ID can be any string value and
- * defaults to "" (empty string).
- *
- * Returns:
- * The registered svc, or %NULL with @errno set on failure.  A block
- * skipped on purpose -- conditional loading, bootstrap over, nowarn --
- * also returns %NULL, with @errno zero.
- */
-svc_t *service_register(int type, char *cfg, struct rlimit rlimit[], char *file)
+svc_t *service_register(cfg_t *sec, int type, struct rlimit rlimit[], char *file)
 {
-	char *cmd, *desc, *runlevels = NULL, *cond = NULL;
-	char *username = NULL, *log = NULL, *pid = NULL;
-	char *name = NULL, *halt = NULL, *delay = NULL;
-	char *id = NULL, *env = NULL, *cgroup = NULL;
-	char *pre_script = NULL, *post_script = NULL;
-	char *ready_script = NULL, *conflict = NULL;
-	char *reload_script = NULL, *stop_script = NULL;
-	char *cleanup_script = NULL;
-	char *caps = NULL;
-	char ident[MAX_IDENT_LEN];
-	char *ifstmt = NULL;
-	char *notify = NULL;
-	char *ctty = NULL;
-	struct tty tty = { 0 };
-	char *dev = NULL;
-	int respawn = 0;
-	int levels = 0;
-	int forking = 0, manual = 0, remain = 0, nowarn = 0;
-	int restart_max = SVC_RESPAWN_MAX;
-	int restart_tmo = 0;
-	unsigned oncrash_action = SVC_ONCRASH_IGNORE;
-	char *line, *args;
 	svc_t *svc;
-
-	if (!cfg) {
+	int nowarn, own, bang;
+	
+	if (!sec) {
 		errx(1, "Invalid input argument");
 		errno = EINVAL;
 		return NULL;
 	}
 
-	line = strdupa(cfg);
-	if (!line) {
-		errno = ENOMEM;
-		return NULL;
+
+	/* section title is the identity: NAME[:ID], %i in templates */
+	char name[80];
+	strlcpy(name, cfg_title(sec), sizeof(name));
+	char *id = strchr(name, ':');
+	if (id) *id++ = 0;
+
+
+	if (type != SVC_TYPE_TTY) {
+		svc = svc_find_by_tty(dev);
+	}
+	else {
+		
+		svc = svc_find(name, id);
 	}
 
-	desc = strstr(line, "-- ");
-	if (desc) {
-		*desc = 0;
-		desc += 3;
 
-		while (*desc && isblank(*desc))
-			desc++;
-	} else {
-		int pos;
-
-		/* Find "--\n" to denote empty/no description */
-		pos = (int)strlen(line) - 2;
-		if (pos > 0 && !strcmp(&line[pos], "--")) {
-			line[pos] = 0;
-			desc = &line[pos];
-		}
-	}
-
-	args = line;
-	cmd = parse_args(&args);
+	const char *cmd = svc_command(sec, &nowarn);
 	if (!cmd) {
-	incomplete:
-		errx(1, "Incomplete service '%s', cannot register", cfg);
-		errno = ENOENT;
-		return NULL;
+		logit(LOG_ERR, "%s: section '%s' missing command, skipping",
+		      file, cfg_title(sec));
+		return;
 	}
 
-	while (cmd) {
-		char *arg;
+	if ((str = sec_getstr(sec, "runlevel", NULL)))
+		addtok(line, sizeof(line), "[%s]", str);
 
-		if (type == SVC_TYPE_TTY && cmd[0] == '@')
-			break;		/* @console */
-
-		if (cmd[0] == '@')	/* @username[:group] */
-			username = &cmd[1];
-		else if (cmd[0] == '[')	/* [runlevels] */
-			runlevels = &cmd[0];
-		else if (cmd[0] == '<')	/* <[!][cond][,cond..]> */
-			cond = &cmd[1];
-		else if (cmd[0] == ':')	/* :ID */
-			id = &cmd[1];
-		else if (MATCH_CMD(cmd, "log", arg))
-			log = cmd;
-		else if (MATCH_CMD(cmd, "pid", arg))
-			pid = cmd;
-		else if (MATCH_CMD(cmd, "name:", arg))
-			name = cmd;
-		else if (MATCH_CMD(cmd, "notify:", arg))
-			notify = arg;
-		else if (MATCH_CMD(cmd, "type:forking", arg))
-			forking = 1;
-		else if (MATCH_CMD(cmd, "manual:yes", arg))
-			manual = 1;
-		else if (MATCH_CMD(cmd, "remain:yes", arg))
-			remain = 1;
-		else if (MATCH_CMD(cmd, "restart:", arg)) {
-			if (MATCH_CMD(arg, "always", arg))
-				restart_max = -1;
-			else
-				restart_max = atoi(arg);
-		}
-		else if (MATCH_CMD(cmd, "restarttmo:", arg)) /* compat alias */
-			restart_tmo = atoi(arg) * 1000;
-		else if (MATCH_CMD(cmd, "restart_sec:", arg))
-			restart_tmo = atoi(arg) * 1000;
-		else if (MATCH_CMD(cmd, "norestart", arg))
-			restart_max = 0;
-		else if (MATCH_CMD(cmd, "nowarn", arg))
-			nowarn = 1;
-		else if (MATCH_CMD(cmd, "oncrash:", arg)) {
-			if (MATCH_CMD(arg, "reboot", arg))
-				oncrash_action = SVC_ONCRASH_REBOOT;
-			if (MATCH_CMD(arg, "script", arg))
-				oncrash_action = SVC_ONCRASH_SCRIPT;
-		}
-		else if (MATCH_CMD(cmd, "respawn", arg))
-			respawn = 1;
-		else if (MATCH_CMD(cmd, "halt:", arg))
-			halt = arg;
-		else if (MATCH_CMD(cmd, "kill:", arg))
-			delay = arg;
-		else if (MATCH_CMD(cmd, "pre:", arg))
-			pre_script = arg;
-		else if (MATCH_CMD(cmd, "post:", arg))
-			post_script = arg;
-		else if (MATCH_CMD(cmd, "ready:", arg))
-			ready_script = arg;
-		else if (MATCH_CMD(cmd, "cleanup:", arg))
-			cleanup_script = arg;
-		else if (MATCH_CMD(cmd, "reload:", arg))
-			reload_script = arg;
-		else if (MATCH_CMD(cmd, "stop:", arg))
-			stop_script = arg;
-		else if (MATCH_CMD(cmd, "env:", arg))
-			env = arg;
-		else if (MATCH_CMD(cmd, "caps:", arg))
-			caps = arg;
-		else if (MATCH_CMD(cmd, "tty:", arg))
-			ctty = arg;
-		/* catch both cgroup: and cgroup. handled in parse_cgroup() */
-		else if (MATCH_CMD(cmd, "cgroup", arg))
-			cgroup = arg;
-		else if (MATCH_CMD(cmd, "conflict:", arg))
-			conflict = arg;
-		else if (MATCH_CMD(cmd, "if:", arg))
-			ifstmt = arg;
-		else
-			break;
-
-		/* Check if valid command follows... */
-		cmd = parse_args(&args);
-		if (!cmd)
-			goto incomplete;
-	}
-
-	name = parse_name(cmd, name);
-	strlcpy(ident, name, sizeof(ident));
-	if (!id) {
-		id = "";
-	} else {
-		strlcat(ident, ":", sizeof(ident));
-		strlcat(ident, id, sizeof(ident));
-	}
-
-	if (ifstmt && !svc_ifthen(1, ident, ifstmt, nowarn)) {
-		errno = 0;
-		return NULL;
-	}
-
-	levels = conf_parse_runlevels(runlevels);
+	int levels = conf_parse_runlevels(runlevels);
 	if (runlevel != INIT_LEVEL && !ISOTHER(levels, INIT_LEVEL)) {
 		dbg("Skipping %s%s%s, bootstrap is completed.",
 		    name, id[0] ? ":" : "", id[0] ? id : "");
@@ -2382,63 +2192,9 @@ svc_t *service_register(int type, char *cfg, struct rlimit rlimit[], char *file)
 		return NULL;
 	}
 
-	if (type == SVC_TYPE_TTY) {
-		size_t i, len;
-		char *ptr;
 
-		if (tty_parse_args(&tty, cmd, &args))
-			return NULL;
 
-		/* NOTE: this may result in dev == NULL! */
-		if (tty_isatcon(tty.dev))
-			dev = tty_atcon();
-		else
-			dev = tty.dev;
-	next:
-		len = 0;
-		if (tty.cmd)
-			len += strlen(tty.cmd);
-		else
-			len += 3;
-		len += tty.num + 1;
-		for (i = 0; i < tty.num; i++)
-			len += strlen(tty.args[i]) + 1;
 
-		line = alloca(len);
-		if (!line)
-			return NULL;
-
-		snprintf(line, len, "%s", tty.cmd ? tty.cmd : "tty");
-		for (i = 0; i < tty.num; i++) {
-			strlcat(line, " ", len);
-			strlcat(line, tty.args[i], len);
-		}
-
-		cmd = strtok_r(line, " \t", &args);
-		if (!cmd)
-			return NULL;
-
-		/* tty's always respawn, never incr. restart_cnt */
-		respawn = 1;
-
-		/* Create name:id tuple for identity, e.g., tty:S0 */
-		if (dev) {
-			ptr = strrchr(dev, '/');
-			if (ptr)
-				ptr++;
-			else
-				ptr = dev;
-			if (!strncmp(ptr, "tty", 3))
-				ptr += 3;
-
-			name = "tty";
-			if (!id || id[0] == 0)
-				id = ptr;
-		}
-
-		svc = svc_find_by_tty(dev);
-	} else
-		svc = svc_find(name, id);
 
 	if (!whichp(cmd)) {
 		if (nowarn) {
@@ -2459,8 +2215,7 @@ svc_t *service_register(int type, char *cfg, struct rlimit rlimit[], char *file)
 			return NULL;
 		}
 
-		if (manual)
-			svc_stop(svc);
+		if (manual)	svc_stop(svc);
 	} else {
 		dbg("Found existing svc for %s name %s id %s type %d", cmd, name, id, type);
 
@@ -2474,261 +2229,13 @@ svc_t *service_register(int type, char *cfg, struct rlimit rlimit[], char *file)
 		if (!manual)
 			svc_unblock(svc);
 	}
-
-	if (username) {
-		char *ptr = strchr(username, ':');
-
-		if (ptr) {
-			char *sup;
-
-			*ptr++ = 0;
-			/* Check for supplementary groups: group,sup1,sup2,... */
-			sup = strchr(ptr, ',');
-			if (sup) {
-				*sup++ = 0;
-				svc->num_supgroups = 0;
-				while (sup) {
-					char *next = strchr(sup, ',');
-					if (next)
-						*next++ = 0;
-					if (svc->num_supgroups >= MAX_NUM_SUPGROUPS) {
-						warn("%s: too many supplementary groups, max %d",
-						     svc->cmd, MAX_NUM_SUPGROUPS);
-						break;
-					}
-					strlcpy(svc->supgroups[svc->num_supgroups], sup,
-						sizeof(svc->supgroups[0]));
-					svc->num_supgroups++;
-					sup = next;
-				}
-			}
-			strlcpy(svc->group, ptr, sizeof(svc->group));
-		}
-		strlcpy(svc->username, username, sizeof(svc->username));
-	} else {
-		getcuser(svc->username, sizeof(svc->username));
-		getcgroup(svc->group, sizeof(svc->group));
-	}
-
+	
 	svc->runlevels = levels;
 	dbg("Service %s runlevel 0x%02x", svc_ident(svc, NULL, 0), svc->runlevels);
 
-	conf_parse_cond(svc, cond);
-
-	if (type == SVC_TYPE_TTY) {
-		if (dev)
-			strlcpy(svc->dev, dev, sizeof(svc->dev));
-		if (tty.baud)
-			strlcpy(svc->baud, tty.baud, sizeof(svc->baud));
-		if (tty.term)
-			strlcpy(svc->term, tty.term, sizeof(svc->term));
-		svc->noclear = tty.noclear;
-		svc->nowait  = tty.nowait;
-		svc->nologin = tty.nologin;
-		svc->notty   = tty.notty;
-		svc->rescue  = tty.rescue;
-
-		/* TTYs cannot be redirected */
-		log = NULL;
-	}
-
-	parse_cmdline_args(svc, cmd, &args);
-
-	/*
-	 * Warn if svc generates same condition (based on name:id)
-	 * as an existing service.
-	 */
-	svc_validate(svc);
-
-	if (halt)
-		parse_sighalt(svc, halt);
-	else
-		svc->sighalt = svc_is_tty(svc) ? SIGHUP : SIGTERM;
-	if (delay)
-		parse_killdelay(svc, delay);
-	else
-		svc->killdelay = SVC_TERM_TIMEOUT;
-	if (pre_script)
-		parse_script(svc, "pre", pre_script, &svc->pre_tmo, svc->pre_script, sizeof(svc->pre_script));
-	else
-		memset(svc->pre_script, 0, sizeof(svc->pre_script));
-	if (post_script)
-		parse_script(svc, "post", post_script, &svc->post_tmo, svc->post_script, sizeof(svc->post_script));
-	else
-		memset(svc->post_script, 0, sizeof(svc->post_script));
-	if (ready_script)
-		parse_script(svc, "ready", ready_script, &svc->ready_tmo, svc->ready_script, sizeof(svc->ready_script));
-	else
-		memset(svc->ready_script, 0, sizeof(svc->ready_script));
-	if (cleanup_script)
-		parse_script(svc, "cleanup", cleanup_script, &svc->cleanup_tmo, svc->cleanup_script, sizeof(svc->cleanup_script));
-	else
-		memset(svc->cleanup_script, 0, sizeof(svc->cleanup_script));
-
-	if (reload_script)
-		parse_script(svc, "reload", reload_script, &svc->reload_tmo, svc->reload_script, sizeof(svc->reload_script));
-	else
-		memset(svc->reload_script, 0, sizeof(svc->reload_script));
-
-	if (stop_script)
-		parse_script(svc, "stop", stop_script, &svc->stop_tmo, svc->stop_script, sizeof(svc->stop_script));
-	else
-		memset(svc->stop_script, 0, sizeof(svc->stop_script));
-
-	if (!svc_is_tty(svc)) {
-		if (log)
-			parse_log(svc, log);
-		else
-			svc->log.enabled = 0;
-	}
-
-	if (notify)
-		svc->notify = parse_notify(notify);
-	  else
-		svc->notify = readiness;
-
-	if (desc)
-		strlcpy(svc->desc, desc, sizeof(svc->desc));
-	else if (type == SVC_TYPE_TTY)
-		snprintf(svc->desc, sizeof(svc->desc), "Getty on %s", svc->dev);
-	if (env)
-		parse_env(svc, env);
-	else
-		memset(svc->env, 0, sizeof(svc->env));
-	if (caps)
-		parse_caps(svc, caps);
-	else
-		memset(svc->capabilities, 0, sizeof(svc->capabilities));
-
-	/* block format only, set by conf.c after registration */
-	memset(svc->pam, 0, sizeof(svc->pam));
-	for (int i = 0; i < NUM_SVCDIRS; i++) {
-		memset((char *)svc + svcdirs[i].off, 0, MAX_ARG_LEN);
-		svc->dir_mode[i] = 0755;
-	}
-	svc->dir_preserve = SVC_DIR_PRESERVE_NO;
-	svc->num_provides = 0;
-
-	if (!svc_is_tty(svc) && ctty) {
-		char *dev = ctty;
-
-		/* NOTE: @console expands only to first console, not all */
-		if (tty_isatcon(ctty))
-			dev = tty_atcon();
-		dev = tty_canonicalize(dev);
-		if (dev)
-			strlcpy(svc->log.ctty, dev, sizeof(svc->log.ctty));
-		else
-			logit(LOG_WARNING, "%s: tty: %s not found, skipping ctty", svc_ident(svc, NULL, 0), ctty);
-	} else if (!svc_is_tty(svc)) {
-		memset(svc->log.ctty, 0, sizeof(svc->log.ctty));
-	}
-
-	if (file)
-		strlcpy(svc->file, file, sizeof(svc->file));
-	else
-		memset(svc->file, 0, sizeof(svc->file));
-	if (conflict)
-		strlcpy(svc->conflict, conflict, sizeof(svc->conflict));
-	else
-		memset(svc->conflict, 0, sizeof(svc->conflict));
-	if (ifstmt)
-		strlcpy(svc->ifstmt, ifstmt, sizeof(svc->ifstmt));
-	else
-		memset(svc->ifstmt, 0, sizeof(svc->ifstmt));
-	svc->manual  = manual;
-	svc->nowarn  = nowarn;
-
-	/*
-	 * remain:yes is not supported for bootstrap-only tasks.  These
-	 * tasks are deleted immediately after completion and their post:
-	 * scripts never run.  This is by design.
-	 */
-	if (remain && svc_is_runtask(svc) && !ISOTHER(levels, INIT_LEVEL)) {
-		logit(LOG_WARNING, "%s: remain:yes ignored for bootstrap-only tasks",
-		      svc_ident(svc, NULL, 0));
-		remain = 0;
-	}
-	svc->remain  = remain;
-	svc->respawn = respawn;
-	svc->forking = forking;
-	svc->restart_max = restart_max;
-	svc->restart_tmo = restart_tmo;
-	svc->oncrash_action = oncrash_action;
-
-	/* Decode any (optional) pid:/optional/path/to/file.pid */
-	if (svc_is_daemon(svc)) {
-		char tmp[sizeof(svc->name) + 6]; /* pid:! + svc->name */
-
-		/* no pid: set, figure out a default to track this svc */
-		if (!pid && forking) {
-			snprintf(tmp, sizeof(tmp), "pid:!%s", svc->name);
-			pid = tmp;
-			logit(LOG_INFO, "%s: forking but no pid:!file set, guessing -> %s", svc->name, tmp);
-		}
-
-		if (pid && pid_file_parse(svc, pid))
-			logit(LOG_WARNING, "%s: service has invalid 'pid:' config: %s", svc->name, pid);
-
-		/* only set forking based on pidfile if user supplied pid: option */
-		if (pid && svc->pidfile[0] == '!')
-			svc->forking = 1;
-	}
-
-	/* Set default restart_tmo for services and TTYs that can restart */
-	if (svc_is_daemon(svc) && svc->restart_tmo == 0) {
-		if (svc_is_forking(svc))
-			svc->restart_tmo = 2000;
-		else
-			svc->restart_tmo = 1;
-	}
-
-	/* TTYs need a longer default to throttle errors (e.g., missing device) */
-	if (svc_is_tty(svc) && svc->restart_tmo == 0)
-		svc->restart_tmo = 2000;
-
-	/* Set configured limits */
-	memcpy(svc->rlimit, rlimit, sizeof(svc->rlimit));
-
-	/* Seed with currently active group, may be empty */
-	strlcpy(svc->cgroup.name, cgroup_current, sizeof(svc->cgroup.name));
-
-	/* Apply cgroup settings if specified */
-	if (cgroup_settings_current[0])
-		strlcpy(svc->cgroup.cfg, cgroup_settings_current, sizeof(svc->cgroup.cfg));
-
-	/* Apply delegation flag */
-	svc->cgroup.delegate = cgroup_delegate_current;
-
-	if (cgroup)
-		parse_cgroup(svc, cgroup);
-
-	/*
-	 * New or modified since the last reload.  The mark is cleared when
-	 * the change has been applied, on start or reload, so one that is
-	 * still set here is a change that has not been applied yet, e.g.
-	 * the service is paused waiting for a condition.  Leave it.
-	 */
-	if ((file && conf_changed(file)) || conf_changed(svc_getenv(svc)) || svc->args_dirty)
-		svc_mark_dirty(svc);
-
-	svc_enable(svc);
-
-	/* for finit native services only, e.g. plugins/hotplug.c */
-	if (!file)
-		svc->protect = 1;
-
-	/* continue expanding any 'tty @console ...' */
-	if (tty_isatcon(tty.dev)) {
-		dev = tty_atcon();
-		if (dev) {
-			id = NULL; /* reset for next tty:ID */
-			goto next;
-		}
-	}
-
-	return svc;
+	return svc;	
 }
+
 
 /*
  * This function is called at the end of a runlevel change or reload

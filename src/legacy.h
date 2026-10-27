@@ -21,11 +21,16 @@
  * THE SOFTWARE.
  */
 
+
+
 #ifndef FINIT_LEGACY_H_
 #define FINIT_LEGACY_H_
 
+#include "svc.h"
+
 int   legacy_parse_conf (char *file, char *buf, int is_rcsd);
 void  legacy_parse_env  (char *line);
+svc_t	 *service_register_legacy	 (int type, char *line, struct rlimit rlimit[], char *file);
 
 #endif	/* FINIT_LEGACY_H_ */
 

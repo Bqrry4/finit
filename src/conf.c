@@ -1123,7 +1123,7 @@ static int sec_getbool(cfg_t *sec, const char *key, const char *alias)
  * The line-based format could only spell this as one stanza per
  * candidate, relying on nowarn to skip the ones that were not
  * installed.  A candidate not being there is not an error here, so
- * only the winner is looked up again by service_register().
+ * only the winner is looked up again by service_register_legacy().
  *
  * A leading '-' still says a missing binary is expected, cf. systemd
  * ExecStart=-.
@@ -1440,7 +1440,7 @@ static void provides_translate(cfg_t *sec, svc_t *svc, char *file)
 /*
  * These have no legacy token, they are validated by service_set_dir()
  * and stored directly on the registered svc.  Empty means unset,
- * service_register() has already cleared the fields.
+ * service_register_legacy() has already cleared the fields.
  */
 static void dirs_translate(cfg_t *sec, svc_t *svc, char *file)
 {
@@ -1521,223 +1521,6 @@ static void pam_translate(cfg_t *sec, svc_t *svc, char *file)
 		      file, cfg_title(sec));
 }
 
-static void svc_translate(cfg_t *sec, int type, struct rlimit rlimit[], char *file)
-{
-	struct rlimit local_rlimit[RLIMIT_NLIMITS];
-	char line[LINE_SIZE] = "";
-	const char *str, *cmd, *grp;
-	int nowarn, own, bang;
-	unsigned int cnt;
-	long num;
-	char buf[512];
-	char nm[80];
-	svc_t *svc;
-	char *id;
-
-	cmd = svc_command(sec, &nowarn);
-	if (!cmd) {
-		logit(LOG_ERR, "%s: section '%s' missing command, skipping",
-		      file, cfg_title(sec));
-		return;
-	}
-
-	if ((str = sec_getstr(sec, "runlevel", NULL)))
-		addtok(line, sizeof(line), "[%s]", str);
-
-	/*
-	 * The ! leading a legacy condition list is not a condition at
-	 * all, and it means two unrelated things depending on the block
-	 * it sits in.  Each has its own key here, valid only where the
-	 * meaning applies, and both translate back to that same !.
-	 */
-	bang = 0;
-	if (type == SVC_TYPE_RUN || type == SVC_TYPE_TASK) {
-		if (cfg_size(sec, "required") && !sec_getbool(sec, "required", NULL))
-			bang = 1;	/* do not hold up bootstrap */
-		if (cfg_size(sec, "reload-signal"))
-			logit(LOG_WARNING, "%s: %s: reload-signal does not apply"
-			      " to run or task, ignoring", file, cfg_title(sec));
-	} else {
-		if ((str = sec_getstr(sec, "reload-signal", NULL))) {
-			/*
-			 * Only SIGHUP and none survive the trip through a
-			 * legacy line, which carries the flag and not the
-			 * signal.
-			 */
-			if (!strcasecmp(str, "none"))
-				bang = 1;
-			else if (str2sig((char *)str) != SIGHUP)
-				logit(LOG_WARNING, "%s: %s: reload-signal is SIGHUP"
-				      " or none, ignoring '%s'", file,
-				      cfg_title(sec), str);
-		}
-		if (cfg_size(sec, "required"))
-			logit(LOG_WARNING, "%s: %s: required only applies to run"
-			      " or task, ignoring", file, cfg_title(sec));
-	}
-
-	if (sec_getlist(sec, "conditions", "cond", buf, sizeof(buf))) {
-		if (buf[0] == '!')
-			logit(LOG_WARNING, "%s: %s: '!' in conditions is not"
-			      " supported, use reload-signal or required",
-			      file, cfg_title(sec));
-		addtok(line, sizeof(line), "<%s%s>", bang ? "!" : "", buf);
-	} else if (bang)
-		addtok(line, sizeof(line), "<!>");
-
-	/* section title is the identity: NAME[:ID], %i in templates */
-	strlcpy(nm, cfg_title(sec), sizeof(nm));
-	id = strchr(nm, ':');
-	if (id)
-		*id++ = 0;
-	addtok(line, sizeof(line), "name:%s", nm);
-	if (id && *id)
-		addtok(line, sizeof(line), ":%s", id);
-
-	/* @user[:group[,extra,...]] */
-	str = sec_getstr(sec, "user", NULL);
-	grp = sec_getstr(sec, "group", NULL);
-	if (sec_getlist(sec, "extra-groups", NULL, buf, sizeof(buf)))
-		addtok(line, sizeof(line), "@%s:%s,%s", str ? str : "root",
-		       grp ? grp : "root", buf);
-	else if (grp)
-		addtok(line, sizeof(line), "@%s:%s", str ? str : "root", grp);
-	else if (str)
-		addtok(line, sizeof(line), "@%s", str);
-
-	if ((str = sec_getstr(sec, "envfile", "env")))
-		addopt(line, sizeof(line), "env:", str);
-
-	addlog(line, sizeof(line), sec, file);
-
-	/*
-	 * The daemon owns its pidfile unless told otherwise, so the
-	 * legacy ! is the default here and pidfile-create drops it.  A
-	 * daemon-owned default path needs no token, that is what the
-	 * pidfile plugin discovers on its own.
-	 */
-	str = sec_getstr(sec, "pidfile", NULL);
-	own = sec_getbool(sec, "pidfile-create", NULL);
-
-	if (str && strcmp(str, "true") && strcmp(str, "false"))
-		addopt(line, sizeof(line), own ? "pid:" : "pid:!", str);
-	else if (own)
-		addtok(line, sizeof(line), "pid");
-
-	if ((str = sec_getstr(sec, "notify", NULL)))
-		addtok(line, sizeof(line), "notify:%s", str);
-
-	if ((str = sec_getstr(sec, "type", NULL))) {
-		if (!strcmp(str, "forking"))
-			addtok(line, sizeof(line), "type:forking");
-		else
-			logit(LOG_WARNING, "%s: unknown type '%s', ignoring",
-			      file, str);
-	}
-
-	if (sec_getbool(sec, "manual-start", "manual"))
-		addtok(line, sizeof(line), "manual:yes");
-	if (sec_getbool(sec, "remain-after-exit", "remain"))
-		addtok(line, sizeof(line), "remain:yes");
-	if (sec_getbool(sec, "respawn", NULL))
-		addtok(line, sizeof(line), "respawn");
-	if (nowarn)
-		addtok(line, sizeof(line), "nowarn");
-	/*
-	 * restart is the policy, restart-max the count.  true is the
-	 * default policy and needs no token unless a count came with it.
-	 */
-	str = sec_getstr(sec, "restart", NULL);
-	if (!str)
-		str = "true";
-	if (!strcmp(str, "never") || !strcmp(str, "false"))
-		addtok(line, sizeof(line), "norestart");
-	else if (!strcmp(str, "always"))
-		addtok(line, sizeof(line), "restart:always");
-	else {
-		if (strcmp(str, "true"))
-			logit(LOG_WARNING, "%s: unknown restart '%s', assuming true",
-			      file, str);
-		if (sec_getint(sec, "restart-max", NULL, &num))
-			addtok(line, sizeof(line), "restart:%ld", num);
-	}
-
-	if (sec_getint(sec, "restart-sec", NULL, &num))
-		addtok(line, sizeof(line), "restart_sec:%ld", num);
-
-	if ((str = sec_getstr(sec, "oncrash", NULL)))
-		addtok(line, sizeof(line), "oncrash:%s", str);
-	if ((str = sec_getstr(sec, "stop-signal", "halt")))
-		addtok(line, sizeof(line), "halt:%s", str);
-	if (sec_getint(sec, "stop-timeout", "kill", &num))
-		addtok(line, sizeof(line), "kill:%ld", num);
-
-	addscript(line, sizeof(line), sec, "exec-start-pre",   "pre:");
-	addscript(line, sizeof(line), sec, "exec-start-ready", "ready:");
-	addscript(line, sizeof(line), sec, "exec-stop",        "stop:");
-	addscript(line, sizeof(line), sec, "exec-stop-post",   "post:");
-	addscript(line, sizeof(line), sec, "exec-reload",      "reload:");
-	addscript(line, sizeof(line), sec, "exec-cleanup",     "cleanup:");
-
-	if (sec_getlist(sec, "capabilities", "caps", buf, sizeof(buf)))
-		addtok(line, sizeof(line), "caps:%s", buf);
-	if (sec_getlist(sec, "conflicts", NULL, buf, sizeof(buf)))
-		addtok(line, sizeof(line), "conflict:%s", buf);
-
-	if ((str = sec_getstr(sec, "if", NULL))) {
-		char ifbuf[MAX_IDENT_LEN + 2];
-
-		if (if_translate(str, ifbuf, sizeof(ifbuf), file, cfg_title(sec)))
-			return;
-		addopt(line, sizeof(line), "if:", ifbuf);
-	}
-	if ((str = sec_getstr(sec, "tty", NULL)))
-		addtok(line, sizeof(line), "tty:%s", str);
-
-	/*
-	 * cgroup NAME {} to join group, settings become overrides.  A
-	 * service joins exactly one group, so on duplicates the last
-	 * one wins, like a repeated token in a legacy one-liner.
-	 */
-	cnt = cfg_size(sec, "cgroup");
-	if (cnt) {
-		cfg_t *cg = cfg_getnsec(sec, "cgroup", cnt - 1);
-
-		if (cnt > 1)
-			logit(LOG_WARNING, "%s: %s declares %u cgroup blocks,"
-			      " using '%s'", file, cfg_title(sec), cnt,
-			      cfg_title(cg));
-
-		cgroup_settings(cg, buf, sizeof(buf), file, 1);
-		if (buf[0])
-			addtok(line, sizeof(line), "cgroup.%s,%s", cfg_title(cg), buf);
-		else
-			addtok(line, sizeof(line), "cgroup.%s", cfg_title(cg));
-	}
-
-	/* per-service rlimit {} on top of the file/global limits */
-	if (cfg_size(sec, "rlimit")) {
-		memcpy(local_rlimit, rlimit, sizeof(local_rlimit));
-		rlimit_translate(cfg_getsec(sec, "rlimit"), local_rlimit);
-		rlimit = local_rlimit;
-	}
-
-	/* the command and its arguments, verbatim */
-	addtok(line, sizeof(line), "%s", cmd);
-
-	if ((str = sec_getstr(sec, "description", "desc")))
-		addtok(line, sizeof(line), "-- %s", str);
-
-	dbg("translated: %s", line);
-	svc = service_register(type, line, rlimit, file);
-	if (!svc)
-		return;
-
-	dirs_translate(sec, svc, file);
-	provides_translate(sec, svc, file);
-	pam_translate(sec, svc, file);
-}
-
 /*
  * Translate tty section, covering all three legacy variants:
  * device (built-in getty), command (external getty), notty/rescue.
@@ -1804,7 +1587,7 @@ static void tty_translate(cfg_t *sec, struct rlimit rlimit[], char *file)
 		addtok(line, sizeof(line), "%s", str);
 
 	dbg("translated: tty %s", line);
-	service_register(SVC_TYPE_TTY, line, rlimit, file);
+	service_register_legacy(SVC_TYPE_TTY, line, rlimit, file);
 }
 
 /*
@@ -2032,10 +1815,7 @@ static int conf_parse_cfg(cfg_t *cfg, char *file, int is_rcsd)
 	qsort(refs, num, sizeof(*refs), secref_cmp);
 
 	for (i = 0; i < num; i++) {
-		if (refs[i].type == SVC_TYPE_TTY)
-			tty_translate(refs[i].sec, arr, file);
-		else
-			svc_translate(refs[i].sec, refs[i].type, arr, file);
+		service_register(refs[i].sec, refs[i].type, arr, file);
 	}
 
 	free(refs);
@@ -2327,7 +2107,7 @@ int conf_reload(void)
 		/* If rescue.conf is missing, fall back to a root shell */
 		rc = conf_parse_file(RESCUE_CONF, 0);
 		if (rc)
-			service_register(SVC_TYPE_TTY, line, global_rlimit, NULL);
+			service_register_legacy(SVC_TYPE_TTY, line, global_rlimit, NULL);
 
 		print(rc, "Entering rescue mode");
 		goto done;
